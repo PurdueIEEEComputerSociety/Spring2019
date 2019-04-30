@@ -1,180 +1,142 @@
-from pprint import pprint as pp
-from glob import glob
-
 import matplotlib.pyplot as plt
-import numpy as np
 
+import numpy as np
+from PIL import Image
 from time import time
 
-from keras.datasets import mnist
-from keras.models import Model, model_from_json
-from keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, Reshape
+import tensorflow as tf
+import tensorflow.contrib.eager as tfe
 
-NUM_EPOCHS		= 20
-BATCH_SIZE		= 70
+from tensorflow.python.keras.preprocessing import image as kp_image
+from tensorflow.python.keras import models
 
-STYLES_DIR		= "scaledStyle"
-CONTENT_DIR		= "scaledContent"
+from Loss import *
 
-def getData(styleDir=STYLES_DIR, contentDir=CONTENT_DIR):
+tf.enable_eager_execution()
 
-	styles = np.array([plt.imread(f)[:,:] for f in glob("{}/*".format(styleDir))])
-	content = np.array([plt.imread(f)[:,:] for f in glob("{}/*".format(contentDir))])
+#	TODO: There must be a better thing for this
+def loadImage(fileName):
+	img = Image.open(fileName)
+	return kp_image.img_to_array(img)
 
-	#	Scale to [0,1]
-	styles = styles.astype('float32')/float(styles.max())
-	content = content.astype('float32')/float(content.max())
+#	TODO: There must be a better thing for this
+def showImage(img):
+	#	Make the color profile correct
+	img = img.astype('uint8')
+	plt.imshow(img)
+	plt.show()
 
-	return (styles, content)
+def deProcessImage(img):
+	#	If the batch dimension exists, remove it
+	if (img.shape[0] == 1):
+		img = np.squeeze(img, axis=0)
+	else:
+		img = img.copy()	#	Only need to deep copy if didn't set it from squeeze
 
-def getModel(x_train, x_test):
+	#	Undo the vgg19 preprocessing
+	img[:, :, 0] += 103.939
+	img[:, :, 1] += 116.779
+	img[:, :, 2] += 123.68
+	img = img[:, :, ::-1]
 
-	enc_in = Input(shape=x_train.shape[1:])
-	enc_c1 = Conv2D(16, (3,3), activation='relu', padding='same')(enc_in)
-	enc_p1 = MaxPooling2D((2,2), padding='same')(enc_c1)
-	enc_c2 = Conv2D(8, (3,3), activation='relu', padding='same')(enc_p1)
-	enc_p2 = MaxPooling2D((2,2), padding='same')(enc_c2)
-	enc_c3 = Conv2D(8, (3,3), activation='relu', padding='same')(enc_p2)
-	enc_p3 = MaxPooling2D((2,2), padding='same')(enc_c3)
-	enc_ls = Reshape((4*4*8,))(enc_p3)
+	return np.clip(img, 0, 255).astype('uint8')
 
-	encoder = Model(inputs=enc_in, outputs=enc_ls, name='encoder')
-	# encoder.summary()
+class StyleTransferModel():
+	def __init__(self, numIterations=10):
+		#	Layers to be extracted for use
+		self.contentLayers = ['block5_conv2'] 
+		self.styleLayers = ['block1_conv1', 'block2_conv1', 'block3_conv1', 'block4_conv1', 'block5_conv1']
 
-	dec_in = Input((4*4*8,))
-	dec_rs = Reshape((4,4,8))(dec_in)
-	dec_c1 = Conv2D(8, (3,3), activation='relu', padding='same')(dec_rs)
-	dec_u1 = UpSampling2D((2,2))(dec_c1)
-	dec_c2 = Conv2D(8, (3,3), activation='relu', padding='same')(dec_u1)
-	dec_u2 = UpSampling2D((2,2))(dec_c2)
-	dec_c3 = Conv2D(16, (3,3), activation='relu')(dec_u2)
-	dec_u3 = UpSampling2D((2,2))(dec_c3)
-	dec_op = Conv2D(1, (3,3), activation='sigmoid', padding='same')(dec_u3)
+		self.numIterations = numIterations
 
-	decoder = Model(inputs=dec_in, outputs=dec_op, name='decoder')
-	# decoder.summary()
+		#	Create the model
+		self.model = self.createModel(self.contentLayers, self.styleLayers)
 
-	autoencoder_output = decoder(encoder(enc_in))
-	autoencoder = Model(enc_in, autoencoder_output)
-	# autoencoder.summary()
+	def summary(self):
+		self.model.summary()
 
-	autoencoder.compile(optimizer='adam', loss='binary_crossentropy')
-	autoencoder.fit(x_train, x_train, epochs=NUM_EPOCHS, batch_size=BATCH_SIZE, validation_data=(x_test,x_test))	
+	def getFeatures(self, image):
+		#	The outputs are delimited by the style later
+		#	Grab [0] to get rid of batch info
+		modelOut = self.model(image)
+		styleFeatures = [styleLayer[0] for styleLayer in modelOut[:len(self.styleLayers)]]
+		styleFeatures = [gram_matrix(styleFeature) for styleFeature in styleFeatures]
+		contentFeatures = [contentLayer[0] for contentLayer in modelOut[len(self.styleLayers):]]
+		return styleFeatures, contentFeatures
+	
+	def setStyleImage(self, fileName):
+		self.rawStyleImage = loadImage(fileName)
+		#	Give it a batch dimension to that tensorflow/keras will play nicely
+		#	Do some preprocessing to scale down the dimensions as desired
+		self.styleImage = tf.keras.applications.vgg19.preprocess_input(np.expand_dims(self.rawStyleImage, axis=0))
+		self.styleFeatures, _ = self.getFeatures(self.styleImage)
+		# self.styleFeatures = [gram_matrix(styleFeature) for styleFeature in self.styleFeatures]
 
-	return (encoder, decoder)
+	def setContentImage(self, fileName):
+		self.rawContentImage = loadImage(fileName)
+		self.contentImage = tf.keras.applications.vgg19.preprocess_input(np.expand_dims(self.rawContentImage, axis=0))
+		_, self.contentFeatures = self.getFeatures(self.contentImage)
 
-def saveModels(models):
-	for model in models:
-		with open('{}.json'.format(model.name), 'w') as file:
-			file.write(model.to_json())
-		model.save_weights('{}.h5'.format(model.name))
+	def createModel(self, contentLayers, styleLayers):
+		vgg = tf.keras.applications.vgg19.VGG19(include_top=False, weights='imagenet')
+		# vgg.trainable = False
 
-def loadModels(modelNames):
-	retval = []
-	for ind, name in enumerate(modelNames):
-		with open(name+".json", 'r') as file:
-			retval.append(model_from_json(file.read()))
-		retval[ind].load_weights(name+".h5")
-	return retval
+		#	Get the outputs of the desired layers
+		style_outputs = [vgg.get_layer(name).output for name in contentLayers]
+		content_outputs = [vgg.get_layer(name).output for name in styleLayers]
+		model_outputs = style_outputs + content_outputs
+		
+		#	Make new model with vgg input and outputs of desired layers
+		return models.Model(vgg.input, model_outputs)
+
+	def transfer(self, alpha=1e3, beta=1e-2):
+		#	Initialize to the content image to save time
+		x = self.contentImage.copy()
+		x = tfe.Variable(x, dtype=tf.float32)
+
+		opt = tf.train.AdamOptimizer(learning_rate=5, beta1=0.99, epsilon=1e-1)
+
+		norm_means = np.array([103.939, 116.779, 123.68])
+		min_vals = -norm_means
+		max_vals = 255 - norm_means   
+
+		startTime = time()
+		for i in range(self.numIterations):
+			print("Iteration {} @ {}s".format(i, time()-startTime))
+			grads = self.gradient(alpha, beta, x)
+
+			#	Update the image
+			opt.apply_gradients([(grads, x)])
+			clipped = tf.clip_by_value(x, min_vals, max_vals)
+			x.assign(clipped)
+
+		return deProcessImage(x.numpy())
+
+	def gradient(self, alpha, beta, x):
+		#	Record gradients while getting loss
+		with tf.GradientTape() as tape:
+			x_style, x_content = self.getFeatures(x)
+
+			#	Assumes each layer contributes an equal amount to the style
+			#	else would need to put /len(x_style) in the zip and make it more complex
+			styleLoss = beta/len(x_style) * sum(get_style_loss(x_s, t_s) for x_s, t_s in zip(x_style, self.styleFeatures))
+
+			contentLoss = alpha/len(x_content) * sum(get_content_loss(x_c, t_c) for x_c, t_c in zip(x_content, self.contentFeatures))
+
+			loss = styleLoss + contentLoss
+
+		return tape.gradient(loss, x)
 
 if __name__ == '__main__':
-	TRAIN = False
+	contentPath = 'scaledContent/29.jpg'
+	stylePath = 'scaledStyle/17.jpg'
 
-	elapsed = -time()
-	styles, content = getData()
-	elapsed += time()
-	print("Time to read data: {}".format(elapsed))
+	model = StyleTransferModel()
 
-	# if TRAIN:
-	# 	encoder, decoder = getModel(train, test)
-	# 	saveModels((encoder, decoder))
-	# else:
-	# 	encoder, decoder = loadModels(('encoder', 'decoder'))
-	# 	encoder.summary()
-	# 	decoder.summary()
+	model.setStyleImage(stylePath)
+	model.setContentImage(contentPath)
+
+	styled = model.transfer()
+	showImage(styled)
 
 
-
-
-	# digits = [test[np.where(test_labels==i)[0][0],:,:] for i in range(10)]
-	# digits[5] = test[np.where(test_labels==5)[0][1],:,:]	#	The first 5 is disgusting
-
-	# _, ax = plt.subplots(2, 5, sharey=True, sharex=True)
-	# for i in range(2):
-	# 	for j in range(5):
-	# 		ax[i,j].imshow(digits[i*5 + j][:,:,0])
-	# # plt.show()
-	# plt.savefig("GroundTruth.png")
-	# plt.clf()
-
-	# latent_digits = encoder.predict(np.array(digits))
-
-	# latent_distances = [[np.linalg.norm(i-j) for j in latent_digits] for i in latent_digits]
-	# for d in latent_distances:
-	# 	print(d)
-
-	# latent_noise = np.random.rand(10, 128)	#	Generate 10 random noise vectors
-
-	# print()
-	# latent_distances = [[np.linalg.norm(i-j) for j in latent_noise] for i in latent_noise]
-	# for d in latent_distances:
-	# 	print(d)
-
-	# styles = [plt.imread(f)[:,:] for f in glob("Styles/*_s.png")]
-
-	# _, ax = plt.subplots(2, 3, sharey=True, sharex=True)
-	# for i in range(2):
-	# 	for j in range(3):
-	# 		ax[i,j].imshow(styles[i*3 + j][:,:,0])
-	# # plt.show()
-	# plt.savefig("Styles.png")
-	# plt.clf()
-
-	# latent_styles = encoder.predict(np.array(styles)[:,:,:,0].reshape(6,28,28,1))
-
-	# latent_experiments = np.array([latent_digits[7] - latent_digits[1],				#	7-1 = top bar?
-	# 							   latent_digits[9] - latent_digits[1],				#	9-1 = 0?
-	# 							   latent_digits[0] + latent_digits[1],				#	0+1=9?
-	# 							   0.6*latent_digits[0] + 0.55*latent_digits[1],		#	scale first
-	# 							   latent_digits[3] * 2,
-	# 							   latent_digits[5] * 2,
-	# 							   latent_digits[5] + 0.1*latent_digits[0],			#	Does this make the 5 curvier?
-	# 							   latent_digits[7] + 0.1*latent_digits[0],			#	Does this make the 7 curvier?
-	# 							   latent_digits[8] + 0.1*latent_digits[7],			#	Does this make the 8 stabbier?
-	# 							   latent_digits[2] + latent_noise[0]				#	Does adding noise do anything?
-	# 								])
-
-
-	# reconstructed_digits = decoder.predict(latent_digits)
-	# reconstructed_noise = decoder.predict(latent_noise)
-	# reconstructed_exps = decoder.predict(latent_experiments)
-	# reconstructed_styles = decoder.predict(latent_styles)
-
-
-	# _, ax = plt.subplots(2, 5, sharey=True, sharex=True)
-	# for i in range(2):
-	# 	for j in range(5):
-	# 		ax[i,j].imshow(reconstructed_digits[i*5 + j][:,:,0])
-	# plt.savefig("Reconstruction.png")
-	# plt.clf()	
-
-	# _, ax = plt.subplots(2, 5, sharey=True, sharex=True)
-	# for i in range(2):
-	# 	for j in range(5):
-	# 		ax[i,j].imshow(reconstructed_noise[i*5 + j][:,:,0])
-	# plt.savefig("Noise.png")
-	# plt.clf()	
-
-	# _, ax = plt.subplots(2, 5, sharey=True, sharex=True)
-	# for i in range(2):
-	# 	for j in range(5):
-	# 		ax[i,j].imshow(reconstructed_exps[i*5 + j][:,:,0])
-	# plt.savefig("Experiments.png")
-	# plt.clf()
-
-	# _, ax = plt.subplots(2, 3, sharey=True, sharex=True)
-	# for i in range(2):
-	# 	for j in range(3):
-	# 		ax[i,j].imshow(reconstructed_styles[i*3 + j][:,:,0])
-	# plt.savefig("Re_Styles.png")
-	# plt.clf()
